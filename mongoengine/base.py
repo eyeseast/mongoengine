@@ -1,10 +1,19 @@
 from queryset import QuerySet, QuerySetManager
+from queryset import DoesNotExist, MultipleObjectsReturned
 
+import sys
 import pymongo
+
+
+_document_registry = {}
+
+def get_document(name):
+    return _document_registry[name]
 
 
 class ValidationError(Exception):
     pass
+
 
 class BaseField(object):
     """A base class for fields in a MongoDB document. Instances of this class
@@ -14,14 +23,22 @@ class BaseField(object):
     # Fields may have _types inserted into indexes by default 
     _index_with_types = True
     
-    def __init__(self, name=None, required=False, default=None, unique=False,
-                 unique_with=None, primary_key=False):
-        self.name = name if not primary_key else '_id'
+    def __init__(self, db_field=None, name=None, required=False, default=None, 
+                 unique=False, unique_with=None, primary_key=False, validation=None,
+                 choices=None):
+        self.db_field = (db_field or name) if not primary_key else '_id'
+        if name:
+            import warnings
+            msg = "Fields' 'name' attribute deprecated in favour of 'db_field'"
+            warnings.warn(msg, DeprecationWarning)
+        self.name = None
         self.required = required or primary_key
         self.default = default
         self.unique = bool(unique or unique_with)
         self.unique_with = unique_with
         self.primary_key = primary_key
+        self.validation = validation
+        self.choices = choices
 
     def __get__(self, instance, owner):
         """Descriptor for retrieving a value from a field in a document. Do 
@@ -55,7 +72,7 @@ class BaseField(object):
         """
         return self.to_python(value)
 
-    def prepare_query_value(self, value):
+    def prepare_query_value(self, op, value):
         """Prepare a value that is being used in a query for PyMongo.
         """
         return value
@@ -65,28 +82,45 @@ class BaseField(object):
         """
         pass
 
+    def _validate(self, value):
+        # check choices
+        if self.choices is not None:
+            if value not in self.choices:
+                raise ValidationError("Value must be one of %s."%unicode(self.choices))
+        
+        # check validation argument
+        if self.validation is not None:
+            if callable(self.validation):
+                if not self.validation(value):
+                    raise ValidationError('Value does not match custom validation method.')
+            else:
+                raise ValueError('validation argument must be a callable.')
+    
+        self.validate(value)
 
 class ObjectIdField(BaseField):
     """An field wrapper around MongoDB's ObjectIds.
     """
     
     def to_python(self, value):
-        return unicode(value)
+        return value
+        # return unicode(value)
 
     def to_mongo(self, value):
         if not isinstance(value, pymongo.objectid.ObjectId):
             try:
-                return pymongo.objectid.ObjectId(str(value))
+                return pymongo.objectid.ObjectId(unicode(value))
             except Exception, e:
-                raise ValidationError(e.message)
+                #e.message attribute has been deprecated since Python 2.6
+                raise ValidationError(unicode(e))
         return value
 
-    def prepare_query_value(self, value):
+    def prepare_query_value(self, op, value):
         return self.to_mongo(value)
 
     def validate(self, value):
         try:
-            pymongo.objectid.ObjectId(str(value))
+            pymongo.objectid.ObjectId(unicode(value))
         except:
             raise ValidationError('Invalid Object ID')
 
@@ -142,13 +176,34 @@ class DocumentMetaclass(type):
         # Add the document's fields to the _fields attribute
         for attr_name, attr_value in attrs.items():
             if hasattr(attr_value, "__class__") and \
-                issubclass(attr_value.__class__, BaseField):
-                if not attr_value.name:
-                    attr_value.name = attr_name
+               issubclass(attr_value.__class__, BaseField):
+                attr_value.name = attr_name
+                if not attr_value.db_field:
+                    attr_value.db_field = attr_name
                 doc_fields[attr_name] = attr_value
         attrs['_fields'] = doc_fields
 
-        return super_new(cls, name, bases, attrs)
+        new_class = super_new(cls, name, bases, attrs)
+        for field in new_class._fields.values():
+            field.owner_document = new_class
+
+        module = attrs.get('__module__')
+        
+        base_excs = tuple(base.DoesNotExist for base in bases 
+                          if hasattr(base, 'DoesNotExist')) or (DoesNotExist,)
+        exc = subclass_exception('DoesNotExist', base_excs, module)
+        new_class.add_to_class('DoesNotExist', exc)
+        
+        base_excs = tuple(base.MultipleObjectsReturned for base in bases 
+                          if hasattr(base, 'MultipleObjectsReturned'))
+        base_excs = base_excs or (MultipleObjectsReturned,)
+        exc = subclass_exception('MultipleObjectsReturned', base_excs, module)
+        new_class.add_to_class('MultipleObjectsReturned', exc)
+    
+        return new_class
+        
+    def add_to_class(self, name, value):
+        setattr(self, name, value)
 
 
 class TopLevelDocumentMetaclass(DocumentMetaclass):
@@ -157,6 +212,8 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
     """
 
     def __new__(cls, name, bases, attrs):
+        global _document_registry
+
         super_new = super(TopLevelDocumentMetaclass, cls).__new__
         # Classes defined in this package are abstract and should not have 
         # their own metadata with DB collection, etc.
@@ -219,7 +276,7 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
                         parts = other_name.split('.')
                         # Lookup real name
                         parts = QuerySet._lookup_field(new_class, parts)
-                        name_parts = [part.name for part in parts]
+                        name_parts = [part.db_field for part in parts]
                         unique_with.append('.'.join(name_parts))
                         # Unique field should be required
                         parts[-1].required = True
@@ -231,19 +288,23 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
 
             # Check for custom primary key
             if field.primary_key:
-                if not new_class._meta['id_field']:
+                current_pk = new_class._meta['id_field']
+                if current_pk and current_pk != field_name:
+                    raise ValueError('Cannot override primary key field')
+
+                if not current_pk:
                     new_class._meta['id_field'] = field_name
                     # Make 'Document.id' an alias to the real primary key field
                     new_class.id = field
-                    #new_class._fields['id'] = field
-                else:
-                    raise ValueError('Cannot override primary key field')
 
         new_class._meta['unique_indexes'] = unique_indexes
 
         if not new_class._meta['id_field']:
             new_class._meta['id_field'] = 'id'
-            new_class.id = new_class._fields['id'] = ObjectIdField(name='_id')
+            new_class._fields['id'] = ObjectIdField(db_field='_id')
+            new_class.id = new_class._fields['id']
+
+        _document_registry[name] = new_class
 
         return new_class
 
@@ -273,7 +334,7 @@ class BaseDocument(object):
         for field, value in fields:
             if value is not None:
                 try:
-                    field.validate(value)
+                    field._validate(value)
                 except (ValueError, AttributeError, AssertionError), e:
                     raise ValidationError('Invalid value for field of type "' +
                                           field.__class__.__name__ + '"')
@@ -345,7 +406,7 @@ class BaseDocument(object):
         for field_name, field in self._fields.items():
             value = getattr(self, field_name, None)
             if value is not None:
-                data[field.name] = field.to_mongo(value)
+                data[field.db_field] = field.to_mongo(value)
         # Only add _cls and _types if allow_inheritance is not False
         if not (hasattr(self, '_meta') and
                 self._meta.get('allow_inheritance', True) == False):
@@ -378,8 +439,26 @@ class BaseDocument(object):
                 return None
             cls = subclasses[class_name]
 
-        for field_name, field in cls._fields.items():
-            if field.name in data:
-                data[field_name] = field.to_python(data[field.name])
+        present_fields = data.keys()
 
-        return cls(**data)
+        for field_name, field in cls._fields.items():
+            if field.db_field in data:
+                data[field_name] = field.to_python(data[field.db_field])
+
+        obj = cls(**data)
+        obj._present_fields = present_fields
+        return obj
+    
+    def __eq__(self, other):
+        if isinstance(other, self.__class__) and hasattr(other, 'id'):
+            if self.id == other.id:
+                return True
+        return False
+
+if sys.version_info < (2, 5):
+    # Prior to Python 2.5, Exception was an old-style class
+    def subclass_exception(name, parents, unused):
+        return types.ClassType(name, parents, {})
+else:
+    def subclass_exception(name, parents, module):
+        return type(name, parents, {'__module__': module})

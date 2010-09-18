@@ -1,10 +1,10 @@
 from connection import _get_db
 
 import pymongo
+import re
 import copy
 
-
-__all__ = ['queryset_manager', 'Q', 'InvalidQueryError', 
+__all__ = ['queryset_manager', 'Q', 'InvalidQueryError',
            'InvalidCollectionError']
 
 # The maximum number of items to display in a QuerySet.__repr__
@@ -12,8 +12,7 @@ REPR_OUTPUT_SIZE = 20
 
 
 class DoesNotExist(Exception):
-	pass
-
+    pass
 
 class MultipleObjectsReturned(Exception):
     pass
@@ -26,35 +25,49 @@ class InvalidQueryError(Exception):
 class OperationError(Exception):
     pass
 
+class InvalidCollectionError(Exception):
+    pass
+
+RE_TYPE = type(re.compile(''))
+
 
 class Q(object):
-    
+
     OR = '||'
     AND = '&&'
     OPERATORS = {
-        'eq': 'this.%(field)s == %(value)s',
-        'neq': 'this.%(field)s != %(value)s',
+        'eq': ('((this.%(field)s instanceof Array) && '
+               '  this.%(field)s.indexOf(%(value)s) != -1) ||'
+               ' this.%(field)s == %(value)s'),
+        'ne': 'this.%(field)s != %(value)s',
         'gt': 'this.%(field)s > %(value)s',
         'gte': 'this.%(field)s >= %(value)s',
         'lt': 'this.%(field)s < %(value)s',
         'lte': 'this.%(field)s <= %(value)s',
         'lte': 'this.%(field)s <= %(value)s',
-        'in': 'this.%(field)s.indexOf(%(value)s) != -1',
-        'nin': 'this.%(field)s.indexOf(%(value)s) == -1',
+        'in': '%(value)s.indexOf(this.%(field)s) != -1',
+        'nin': '%(value)s.indexOf(this.%(field)s) == -1',
         'mod': '%(field)s %% %(value)s',
         'all': ('%(value)s.every(function(a){'
                 'return this.%(field)s.indexOf(a) != -1 })'),
         'size': 'this.%(field)s.length == %(value)s',
         'exists': 'this.%(field)s != null',
+        'regex_eq': '%(value)s.test(this.%(field)s)',
+        'regex_ne': '!%(value)s.test(this.%(field)s)',
     }
-    
+
     def __init__(self, **query):
         self.query = [query]
 
     def _combine(self, other, op):
         obj = Q()
-        obj.query = ['('] + copy.deepcopy(self.query) + [op]
-        obj.query += copy.deepcopy(other.query) + [')']
+        if not other.query[0]:
+            return self
+        if self.query[0]:
+            obj.query = (['('] + copy.deepcopy(self.query) + [op] +
+                         copy.deepcopy(other.query) + [')'])
+        else:
+            obj.query = copy.deepcopy(other.query)
         return obj
 
     def __or__(self, other):
@@ -90,43 +103,66 @@ class Q(object):
                 for j, (op, value) in enumerate(value.items()):
                     # Create a custom variable name for this operator
                     op_value_name = '%so%s' % (value_name, j)
+                    # Construct the JS that uses this op
+                    value, operation_js = self._build_op_js(op, key, value,
+                                                            op_value_name)
                     # Update the js scope with the value for this op
                     js_scope[op_value_name] = value
-                    # Construct the JS that uses this op
-                    operation_js = Q.OPERATORS[op.strip('$')] % {
-                        'field': key, 
-                        'value': op_value_name
-                    }
                     js.append(operation_js)
             else:
-                js_scope[value_name] = value
                 # Construct the JS for this field
-                field_js = Q.OPERATORS[op.strip('$')] % {
-                    'field': key, 
-                    'value': value_name
-                }
+                value, field_js = self._build_op_js(op, key, value, value_name)
+                js_scope[value_name] = value
                 js.append(field_js)
+        print ' && '.join(js)
         return ' && '.join(js)
 
+    def _build_op_js(self, op, key, value, value_name):
+        """Substitute the values in to the correct chunk of Javascript.
+        """
+        print op, key, value, value_name
+        if isinstance(value, RE_TYPE):
+            # Regexes are handled specially
+            if op.strip('$') == 'ne':
+                op_js = Q.OPERATORS['regex_ne']
+            else:
+                op_js = Q.OPERATORS['regex_eq']
+        else:
+            op_js = Q.OPERATORS[op.strip('$')]
+
+        # Comparing two ObjectIds in Javascript doesn't work..
+        if isinstance(value, pymongo.objectid.ObjectId):
+            value = unicode(value)
+
+        # Perform the substitution
+        operation_js = op_js % {
+            'field': key, 
+            'value': value_name
+        }
+        return value, operation_js
 
 class QuerySet(object):
-    """A set of results returned from a query. Wraps a MongoDB cursor, 
+    """A set of results returned from a query. Wraps a MongoDB cursor,
     providing :class:`~mongoengine.Document` objects as the results.
     """
-    
+
     def __init__(self, document, collection):
         self._document = document
         self._collection_obj = collection
         self._accessed_collection = False
         self._query = {}
         self._where_clause = None
-
+        self._loaded_fields = []
+        self._ordering = []
+        
         # If inheritance is allowed, only return instances and instances of
         # subclasses of the class being used
         if document._meta.get('allow_inheritance'):
             self._query = {'_types': self._document._class_name}
         self._cursor_obj = None
-        
+        self._limit = None
+        self._skip = None
+
     def ensure_index(self, key_or_list):
         """Ensure that the given indexes are in place.
 
@@ -159,7 +195,7 @@ class QuerySet(object):
             # objects for the next part (list field checking)
             parts = key.split('.')
             fields = QuerySet._lookup_field(doc_cls, parts)
-            parts = [field.name for field in fields]
+            parts = [field.db_field for field in fields]
             key = '.'.join(parts)
             index_list.append((key, direction))
 
@@ -174,7 +210,7 @@ class QuerySet(object):
         return index_list
 
     def __call__(self, q_obj=None, **query):
-        """Filter the selected documents by calling the 
+        """Filter the selected documents by calling the
         :class:`~mongoengine.queryset.QuerySet` with a query.
 
         :param q_obj: a :class:`~mongoengine.queryset.Q` object to be used in
@@ -188,7 +224,7 @@ class QuerySet(object):
         query = QuerySet._transform_query(_doc_cls=self._document, **query)
         self._query.update(query)
         return self
-        
+
     def filter(self, *q_objs, **query):
         """An alias of :meth:`~mongoengine.queryset.QuerySet.__call__`
         """
@@ -201,7 +237,7 @@ class QuerySet(object):
         """
         if not self._accessed_collection:
             self._accessed_collection = True
-
+            
             # Ensure document-defined indexes are created
             if self._document._meta['indexes']:
                 for key_or_list in self._document._meta['indexes']:
@@ -215,20 +251,29 @@ class QuerySet(object):
             # If _types is being used (for polymorphism), it needs an index
             if '_types' in self._query:
                 self._collection.ensure_index('_types')
+            
+            # Ensure all needed field indexes are created
+            for field_name, field_instance in self._document._fields.iteritems():
+                if field_instance.__class__.__name__ == 'GeoLocationField':
+                    self._collection.ensure_index([(field_name, pymongo.GEO2D),])
         return self._collection_obj
 
     @property
     def _cursor(self):
         if self._cursor_obj is None:
-            self._cursor_obj = self._collection.find(self._query)
+            cursor_args = {}
+            if self._loaded_fields:
+                cursor_args = {'fields': self._loaded_fields}
+            self._cursor_obj = self._collection.find(self._query, 
+                                                     **cursor_args)
             # Apply where clauses to cursor
             if self._where_clause:
                 self._cursor_obj.where(self._where_clause)
-            
+
             # apply default ordering
             if self._document._meta['ordering']:
                 self.order_by(*self._document._meta['ordering'])
-            
+
         return self._cursor_obj
 
     @classmethod
@@ -258,38 +303,46 @@ class QuerySet(object):
         """Translate a field attribute name to a database field name.
         """
         parts = field.split(sep)
-        parts = [f.name for f in QuerySet._lookup_field(doc_cls, parts)]
+        parts = [f.db_field for f in QuerySet._lookup_field(doc_cls, parts)]
         return '.'.join(parts)
 
     @classmethod
     def _transform_query(cls, _doc_cls=None, **query):
         """Transform a query from Django-style format to Mongo format.
         """
-        operators = ['neq', 'gt', 'gte', 'lt', 'lte', 'in', 'nin', 'mod',
-                     'all', 'size', 'exists']
+        operators = ['ne', 'gt', 'gte', 'lt', 'lte', 'in', 'nin', 'mod',
+                     'all', 'size', 'exists', 'near']
+        match_operators = ['contains', 'icontains', 'startswith',
+                           'istartswith', 'endswith', 'iendswith',
+                           'exact', 'iexact']
 
         mongo_query = {}
         for key, value in query.items():
             parts = key.split('__')
             # Check for an operator and transform to mongo-style if there is
             op = None
-            if parts[-1] in operators:
+            if parts[-1] in operators + match_operators:
                 op = parts.pop()
 
             if _doc_cls:
                 # Switch field names to proper names [set in Field(name='foo')]
                 fields = QuerySet._lookup_field(_doc_cls, parts)
-                parts = [field.name for field in fields]
+                parts = [field.db_field for field in fields]
 
                 # Convert value to proper value
                 field = fields[-1]
-                if op in (None, 'neq', 'gt', 'gte', 'lt', 'lte'):
-                    value = field.prepare_query_value(value)
+                singular_ops = [None, 'ne', 'gt', 'gte', 'lt', 'lte']
+                singular_ops += match_operators
+                if op in singular_ops:
+                    value = field.prepare_query_value(op, value)
                 elif op in ('in', 'nin', 'all'):
                     # 'in', 'nin' and 'all' require a list of values
-                    value = [field.prepare_query_value(v) for v in value]
+                    value = [field.prepare_query_value(op, v) for v in value]
 
-            if op:
+                if field.__class__.__name__ == 'GenericReferenceField':
+                    parts.append('_ref')
+
+            if op and op not in match_operators:
                 value = {'$' + op: value}
 
             key = '.'.join(parts)
@@ -301,10 +354,13 @@ class QuerySet(object):
         return mongo_query
 
     def get(self, *q_objs, **query):
-        """Retrieve the the matching object raising 
-        :class:`~mongoengine.queryset.MultipleObjectsReturned` or 
-        :class:`~mongoengine.queryset.DoesNotExist` exceptions if multiple or
-        no results are found.
+        """Retrieve the the matching object raising
+        :class:`~mongoengine.queryset.MultipleObjectsReturned` or
+        `DocumentName.MultipleObjectsReturned` exception if multiple results and
+        :class:`~mongoengine.queryset.DoesNotExist` or `DocumentName.DoesNotExist`
+        if no results are found.
+
+        .. versionadded:: 0.3
         """
         self.__call__(*q_objs, **query)
         count = self.count()
@@ -312,33 +368,39 @@ class QuerySet(object):
             return self[0]
         elif count > 1:
             message = u'%d items returned, instead of 1' % count
-            raise MultipleObjectsReturned(message)
+            raise self._document.MultipleObjectsReturned(message)
         else:
-            raise DoesNotExist('Document not found')
+            raise self._document.DoesNotExist("%s matching query does not exist."
+                                              % self._document._class_name)
 
     def get_or_create(self, *q_objs, **query):
-        """Retreive unique object or create, if it doesn't exist. Raises
-        :class:`~mongoengine.queryset.MultipleObjectsReturned` if multiple 
-        results are found. A new document will be created if the document 
-        doesn't exists; a dictionary of default values for the new document
-        may be provided as a keyword argument called :attr:`defaults`.
+        """Retrieve unique object or create, if it doesn't exist. Returns a tuple of 
+        ``(object, created)``, where ``object`` is the retrieved or created object 
+        and ``created`` is a boolean specifying whether a new object was created. Raises
+        :class:`~mongoengine.queryset.MultipleObjectsReturned` or
+        `DocumentName.MultipleObjectsReturned` if multiple results are found.
+        A new document will be created if the document doesn't exists; a
+        dictionary of default values for the new document may be provided as a
+        keyword argument called :attr:`defaults`.
+
+        .. versionadded:: 0.3
         """
         defaults = query.get('defaults', {})
-        if query.has_key('defaults'):
+        if 'defaults' in query:
             del query['defaults']
-        
+
         self.__call__(*q_objs, **query)
         count = self.count()
         if count == 0:
             query.update(defaults)
             doc = self._document(**query)
             doc.save()
-            return doc
+            return doc, True
         elif count == 1:
-            return self.first()
+            return self.first(), False
         else:
             message = u'%d items returned, instead of 1' % count
-            raise MultipleObjectsReturned(message)
+            raise self._document.MultipleObjectsReturned(message)
 
     def first(self):
         """Retrieve the first object matching the query.
@@ -362,18 +424,125 @@ class QuerySet(object):
             result = self._document._from_son(result)
         return result
 
+    def in_bulk(self, object_ids):
+        """Retrieve a set of documents by their ids.
+        
+        :param object_ids: a list or tuple of ``ObjectId``\ s
+        :rtype: dict of ObjectIds as keys and collection-specific
+                Document subclasses as values.
+
+        .. versionadded:: 0.3
+        """
+        doc_map = {}
+
+        docs = self._collection.find({'_id': {'$in': object_ids}})
+        for doc in docs:
+            doc_map[doc['_id']] = self._document._from_son(doc)
+ 
+        return doc_map
+
     def next(self):
         """Wrap the result in a :class:`~mongoengine.Document` object.
         """
-        return self._document._from_son(self._cursor.next())
+        try:
+            if self._limit == 0:
+                raise StopIteration
+            return self._document._from_son(self._cursor.next())
+        except StopIteration, e:
+            self.rewind()
+            raise e
+
+    def rewind(self):
+        """Rewind the cursor to its unevaluated state.
+
+        .. versionadded:: 0.3
+        """
+        self._cursor.rewind()
 
     def count(self):
         """Count the selected elements in the query.
         """
-        return self._cursor.count()
+        if self._limit == 0:
+            return 0
+        return self._cursor.count(with_limit_and_skip=True)
 
     def __len__(self):
         return self.count()
+
+    def map_reduce(self, map_f, reduce_f, finalize_f=None, limit=None,
+                   scope=None, keep_temp=False):
+        """Perform a map/reduce query using the current query spec
+        and ordering. While ``map_reduce`` respects ``QuerySet`` chaining,
+        it must be the last call made, as it does not return a maleable
+        ``QuerySet``.
+
+        See the :meth:`~mongoengine.tests.QuerySetTest.test_map_reduce`
+        and :meth:`~mongoengine.tests.QuerySetTest.test_map_advanced`
+        tests in ``tests.queryset.QuerySetTest`` for usage examples.
+
+        :param map_f: map function, as :class:`~pymongo.code.Code` or string
+        :param reduce_f: reduce function, as
+                         :class:`~pymongo.code.Code` or string
+        :param finalize_f: finalize function, an optional function that
+                           performs any post-reduction processing.
+        :param scope: values to insert into map/reduce global scope. Optional.
+        :param limit: number of objects from current query to provide
+                      to map/reduce method
+        :param keep_temp: keep temporary table (boolean, default ``True``)
+
+        Returns an iterator yielding
+        :class:`~mongoengine.document.MapReduceDocument`.
+
+        .. note:: Map/Reduce requires server version **>= 1.1.1**. The PyMongo
+           :meth:`~pymongo.collection.Collection.map_reduce` helper requires
+           PyMongo version **>= 1.2**.
+
+        .. versionadded:: 0.3
+        """
+        from document import MapReduceDocument
+
+        if not hasattr(self._collection, "map_reduce"):
+            raise NotImplementedError("Requires MongoDB >= 1.1.1")
+
+        map_f_scope = {}
+        if isinstance(map_f, pymongo.code.Code):
+            map_f_scope = map_f.scope
+            map_f = unicode(map_f)
+        map_f = pymongo.code.Code(self._sub_js_fields(map_f), map_f_scope)
+
+        reduce_f_scope = {}
+        if isinstance(reduce_f, pymongo.code.Code):
+            reduce_f_scope = reduce_f.scope
+            reduce_f = unicode(reduce_f)
+        reduce_f_code = self._sub_js_fields(reduce_f)
+        reduce_f = pymongo.code.Code(reduce_f_code, reduce_f_scope)
+
+        mr_args = {'query': self._query, 'keeptemp': keep_temp}
+
+        if finalize_f:
+            finalize_f_scope = {}
+            if isinstance(finalize_f, pymongo.code.Code):
+                finalize_f_scope = finalize_f.scope
+                finalize_f = unicode(finalize_f)
+            finalize_f_code = self._sub_js_fields(finalize_f)
+            finalize_f = pymongo.code.Code(finalize_f_code, finalize_f_scope)
+            mr_args['finalize'] = finalize_f
+
+        if scope:
+            mr_args['scope'] = scope
+
+        if limit:
+            mr_args['limit'] = limit
+
+        results = self._collection.map_reduce(map_f, reduce_f, **mr_args)
+        results = results.find()
+
+        if self._ordering:
+            results = results.sort(self._ordering)
+
+        for doc in results:
+            yield MapReduceDocument(self._document, self._collection,
+                                    doc['_id'], doc['value'])
 
     def limit(self, n):
         """Limit the number of returned documents to `n`. This may also be
@@ -381,7 +550,12 @@ class QuerySet(object):
 
         :param n: the maximum number of objects to return
         """
-        self._cursor.limit(n)
+        if n == 0:
+            self._cursor.limit(1)
+        else:
+            self._cursor.limit(n)
+        self._limit = n
+
         # Return self to allow chaining
         return self
 
@@ -392,6 +566,7 @@ class QuerySet(object):
         :param n: the number of objects to skip before returning results
         """
         self._cursor.skip(n)
+        self._skip = n
         return self
 
     def __getitem__(self, key):
@@ -401,12 +576,15 @@ class QuerySet(object):
         if isinstance(key, slice):
             try:
                 self._cursor_obj = self._cursor[key]
+                self._skip, self._limit = key.start, key.stop
             except IndexError, err:
                 # PyMongo raises an error if key.start == key.stop, catch it,
                 # bin it, kill it. 
-                if key.start >=0 and key.stop >= 0 and key.step is None:
-                    if key.start == key.stop:
+                start = key.start or 0
+                if start >= 0 and key.stop >= 0 and key.step is None:
+                    if start == key.stop:
                         self.limit(0)
+                        self._skip, self._limit = key.start, key.stop - start
                         return self
                 raise err
             # Allow further QuerySet modifications to be performed
@@ -414,6 +592,29 @@ class QuerySet(object):
         # Integer index provided
         elif isinstance(key, int):
             return self._document._from_son(self._cursor[key])
+
+    def only(self, *fields):
+        """Load only a subset of this document's fields. ::
+        
+            post = BlogPost.objects(...).only("title")
+        
+        :param fields: fields to include
+
+        .. versionadded:: 0.3
+        """
+        self._loaded_fields = []
+        for field in fields:
+            if '.' in field:
+                raise InvalidQueryError('Subfields cannot be used as '
+                                        'arguments to QuerySet.only')
+            # Translate field name
+            field = QuerySet._lookup_field(self._document, field)[-1].db_field
+            self._loaded_fields.append(field)
+
+        # _cls is needed for polymorphism
+        if self._document._meta.get('allow_inheritance'):
+            self._loaded_fields += ['_cls']
+        return self
 
     def order_by(self, *keys):
         """Order the :class:`~mongoengine.queryset.QuerySet` by the keys. The
@@ -430,13 +631,14 @@ class QuerySet(object):
                 direction = pymongo.DESCENDING
             if key[0] in ('-', '+'):
                 key = key[1:]
-            key_list.append((key, direction)) 
+            key_list.append((key, direction))
 
+        self._ordering = key_list
         self._cursor.sort(key_list)
         return self
-        
+
     def explain(self, format=False):
-        """Return an explain plan record for the 
+        """Return an explain plan record for the
         :class:`~mongoengine.queryset.QuerySet`\ 's cursor.
 
         :param format: format the plan before returning it
@@ -447,7 +649,7 @@ class QuerySet(object):
             import pprint
             plan = pprint.pformat(plan)
         return plan
-        
+
     def delete(self, safe=False):
         """Delete the documents matched by the query.
 
@@ -459,7 +661,7 @@ class QuerySet(object):
     def _transform_update(cls, _doc_cls=None, **update):
         """Transform an update spec from Django-style format to Mongo format.
         """
-        operators = ['set', 'unset', 'inc', 'dec', 'push', 'push_all', 'pull', 
+        operators = ['set', 'unset', 'inc', 'dec', 'push', 'push_all', 'pull',
                      'pull_all']
 
         mongo_update = {}
@@ -482,14 +684,14 @@ class QuerySet(object):
             if _doc_cls:
                 # Switch field names to proper names [set in Field(name='foo')]
                 fields = QuerySet._lookup_field(_doc_cls, parts)
-                parts = [field.name for field in fields]
+                parts = [field.db_field for field in fields]
 
                 # Convert value to proper value
                 field = fields[-1]
                 if op in (None, 'set', 'unset', 'push', 'pull'):
-                    value = field.prepare_query_value(value)
+                    value = field.prepare_query_value(op, value)
                 elif op in ('pushAll', 'pullAll'):
-                    value = [field.prepare_query_value(v) for v in value]
+                    value = [field.prepare_query_value(op, v) for v in value]
 
             key = '.'.join(parts)
 
@@ -504,7 +706,7 @@ class QuerySet(object):
 
         return mongo_update
 
-    def update(self, safe_update=True, **update):
+    def update(self, safe_update=True, upsert=False, **update):
         """Perform an atomic update on the fields matched by the query.
 
         :param safe: check if the operation succeeded before returning
@@ -518,14 +720,14 @@ class QuerySet(object):
         update = QuerySet._transform_update(self._document, **update)
         try:
             self._collection.update(self._query, update, safe=safe_update, 
-                                    multi=True)
+                                    upsert=upsert, multi=True)
         except pymongo.errors.OperationFailure, err:
             if unicode(err) == u'multi not coded yet':
                 message = u'update() method requires MongoDB 1.1.3+'
                 raise OperationError(message)
             raise OperationError(u'Update failed (%s)' % unicode(err))
 
-    def update_one(self, safe_update=True, **update):
+    def update_one(self, safe_update=True, upsert=False, **update):
         """Perform an atomic update on first field matched by the query.
 
         :param safe: check if the operation succeeded before returning
@@ -539,31 +741,55 @@ class QuerySet(object):
             # as the default may change to 'True'
             if pymongo.version >= '1.1.1':
                 self._collection.update(self._query, update, safe=safe_update, 
-                                        multi=False)
+                                        upsert=upsert, multi=False)
             else:
                 # Older versions of PyMongo don't support 'multi'
                 self._collection.update(self._query, update, safe=safe_update)
         except pymongo.errors.OperationFailure, e:
-            raise OperationError('Update failed [%s]' % str(e))
+            raise OperationError(u'Update failed [%s]' % unicode(e))
 
     def __iter__(self):
         return self
+
+    def _sub_js_fields(self, code):
+        """When fields are specified with [~fieldname] syntax, where 
+        *fieldname* is the Python name of a field, *fieldname* will be 
+        substituted for the MongoDB name of the field (specified using the
+        :attr:`name` keyword argument in a field's constructor).
+        """
+        def field_sub(match):
+            # Extract just the field name, and look up the field objects
+            field_name = match.group(1).split('.')
+            fields = QuerySet._lookup_field(self._document, field_name)
+            # Substitute the correct name for the field into the javascript
+            return u'["%s"]' % fields[-1].db_field
+
+        return re.sub(u'\[\s*~([A-z_][A-z_0-9.]+?)\s*\]', field_sub, code)
 
     def exec_js(self, code, *fields, **options):
         """Execute a Javascript function on the server. A list of fields may be
         provided, which will be translated to their correct names and supplied
         as the arguments to the function. A few extra variables are added to
-        the function's scope: ``collection``, which is the name of the 
-        collection in use; ``query``, which is an object representing the 
+        the function's scope: ``collection``, which is the name of the
+        collection in use; ``query``, which is an object representing the
         current query; and ``options``, which is an object containing any
         options specified as keyword arguments.
+
+        As fields in MongoEngine may use different names in the database (set
+        using the :attr:`db_field` keyword argument to a :class:`Field` 
+        constructor), a mechanism exists for replacing MongoEngine field names
+        with the database field names in Javascript code. When accessing a 
+        field, use square-bracket notation, and prefix the MongoEngine field
+        name with a tilde (~).
 
         :param code: a string of Javascript code to execute
         :param fields: fields that you will be using in your function, which
             will be passed in to your function as arguments
-        :param options: options that you want available to the function 
+        :param options: options that you want available to the function
             (accessed in Javascript through the ``options`` object)
         """
+        code = self._sub_js_fields(code)
+
         fields = [QuerySet._translate_field_name(self._document, f)
                   for f in fields]
         collection = self._document._meta['collection']
@@ -576,7 +802,7 @@ class QuerySet(object):
         query = self._query
         if self._where_clause:
             query['$where'] = self._where_clause
-        
+
         scope['query'] = query
         code = pymongo.code.Code(code, scope=scope)
 
@@ -624,7 +850,7 @@ class QuerySet(object):
     def item_frequencies(self, list_field, normalize=False):
         """Returns a dictionary of all items present in a list field across
         the whole queried set of documents, and their corresponding frequency.
-        This is useful for generating tag clouds, or searching documents. 
+        This is useful for generating tag clouds, or searching documents.
 
         :param list_field: the list field to use
         :param normalize: normalize the results so they add to 1.0
@@ -654,13 +880,13 @@ class QuerySet(object):
         return self.exec_js(freq_func, list_field, normalize=normalize)
 
     def __repr__(self):
-        data = list(self[:REPR_OUTPUT_SIZE + 1])
+        limit = REPR_OUTPUT_SIZE + 1
+        if self._limit is not None and self._limit < limit:
+            limit = self._limit
+        data = list(self[self._skip:limit])
         if len(data) > REPR_OUTPUT_SIZE:
             data[-1] = "...(remaining elements truncated)..."
         return repr(data)
-
-class InvalidCollectionError(Exception):
-    pass
 
 
 class QuerySetManager(object):
@@ -670,7 +896,7 @@ class QuerySetManager(object):
         self._collection = None
 
     def __get__(self, instance, owner):
-        """Descriptor for instantiating a new QuerySet object when 
+        """Descriptor for instantiating a new QuerySet object when
         Document.objects is accessed.
         """
         if instance is not None:
@@ -689,7 +915,7 @@ class QuerySetManager(object):
 
                 if collection in db.collection_names():
                     self._collection = db[collection]
-                    # The collection already exists, check if its capped 
+                    # The collection already exists, check if its capped
                     # options match the specified capped options
                     options = self._collection.options()
                     if options.get('max') != max_documents or \
@@ -702,15 +928,19 @@ class QuerySetManager(object):
                     opts = {'capped': True, 'size': max_size}
                     if max_documents:
                         opts['max'] = max_documents
-                    self._collection = db.create_collection(collection, opts)
+                    self._collection = db.create_collection(collection, **opts)
             else:
                 self._collection = db[collection]
-        
+
         # owner is the document that contains the QuerySetManager
         queryset = QuerySet(owner, self._collection)
         if self._manager_func:
-            queryset = self._manager_func(owner, queryset)
+            if self._manager_func.func_code.co_argcount == 1:
+                queryset = self._manager_func(queryset)
+            else:
+                queryset = self._manager_func(owner, queryset)
         return queryset
+
 
 def queryset_manager(func):
     """Decorator that allows you to define custom QuerySet managers on
@@ -720,4 +950,8 @@ def queryset_manager(func):
     function should return a :class:`~mongoengine.queryset.QuerySet`, probably
     the same one that was passed in, but modified in some way.
     """
+    if func.func_code.co_argcount == 1:
+        import warnings
+        msg = 'Methods decorated with queryset_manager should take 2 arguments'
+        warnings.warn(msg, DeprecationWarning)
     return QuerySetManager(func)

@@ -1,5 +1,5 @@
 import unittest
-import datetime
+from datetime import datetime
 import pymongo
 
 from mongoengine import *
@@ -127,6 +127,11 @@ class DocumentTest(unittest.TestCase):
         self.assertEqual(Employee._meta['collection'], 
                          self.Person._meta['collection'])
 
+        # Ensure that MRO error is not raised
+        class A(Document): pass
+        class B(A): pass
+        class C(B): pass
+
     def test_allow_inheritance(self):
         """Ensure that inheritance may be disabled on simple classes and that
         _cls and _types will not be used.
@@ -199,7 +204,7 @@ class DocumentTest(unittest.TestCase):
         """Ensure that capped collections work properly.
         """
         class Log(Document):
-            date = DateTimeField(default=datetime.datetime.now)
+            date = DateTimeField(default=datetime.now)
             meta = {
                 'max_documents': 10,
                 'max_size': 90000,
@@ -225,7 +230,7 @@ class DocumentTest(unittest.TestCase):
         # Check that the document cannot be redefined with different options
         def recreate_log_document():
             class Log(Document):
-                date = DateTimeField(default=datetime.datetime.now)
+                date = DateTimeField(default=datetime.now)
                 meta = {
                     'max_documents': 11,
                 }
@@ -239,7 +244,7 @@ class DocumentTest(unittest.TestCase):
         """Ensure that indexes are used when meta[indexes] is specified.
         """
         class BlogPost(Document):
-            date = DateTimeField(name='addDate', default=datetime.datetime.now)
+            date = DateTimeField(db_field='addDate', default=datetime.now)
             category = StringField()
             tags = ListField(StringField())
             meta = {
@@ -297,7 +302,7 @@ class DocumentTest(unittest.TestCase):
         self.assertRaises(OperationError, post2.save)
 
         class Date(EmbeddedDocument):
-            year = IntField(name='yr')
+            year = IntField(db_field='yr')
 
         class BlogPost(Document):
             title = StringField()
@@ -328,7 +333,7 @@ class DocumentTest(unittest.TestCase):
 
         User.drop_collection()
 
-        self.assertEqual(User._fields['username'].name, '_id')
+        self.assertEqual(User._fields['username'].db_field, '_id')
         self.assertEqual(User._meta['id_field'], 'username')
 
         def create_invalid_user():
@@ -339,6 +344,9 @@ class DocumentTest(unittest.TestCase):
             class EmailUser(User):
                 email = StringField(primary_key=True)
         self.assertRaises(ValueError, define_invalid_user)
+
+        class EmailUser(User):
+            email = StringField()
         
         user = User(username='test', name='test user')
         user.save()
@@ -423,7 +431,7 @@ class DocumentTest(unittest.TestCase):
         comment.date = 4
         self.assertRaises(ValidationError, comment.validate)
 
-        comment.date = datetime.datetime.now()
+        comment.date = datetime.now()
         comment.validate()
 
     def test_save(self):
@@ -437,7 +445,7 @@ class DocumentTest(unittest.TestCase):
         person_obj = collection.find_one({'name': 'Test User'})
         self.assertEqual(person_obj['name'], 'Test User')
         self.assertEqual(person_obj['age'], 30)
-        self.assertEqual(str(person_obj['_id']), person.id)
+        self.assertEqual(person_obj['_id'], person.id)
 
     def test_delete(self):
         """Ensure that document may be deleted using the delete method.

@@ -1,5 +1,8 @@
 import unittest
 import datetime
+from decimal import Decimal
+
+import pymongo
 
 from mongoengine import *
 from mongoengine.connection import _get_db
@@ -79,6 +82,19 @@ class FieldTest(unittest.TestCase):
         person.name = 'Shorter name'
         person.validate()
 
+    def test_url_validation(self):
+        """Ensure that URLFields validate urls properly.
+        """
+        class Link(Document):
+            url = URLField()
+
+        link = Link()
+        link.url = 'google'
+        self.assertRaises(ValidationError, link.validate)
+
+        link.url = 'http://www.google.com:8080'
+        link.validate()
+        
     def test_int_validation(self):
         """Ensure that invalid values cannot be assigned to int fields.
         """
@@ -112,6 +128,32 @@ class FieldTest(unittest.TestCase):
         self.assertRaises(ValidationError, person.validate)
         person.height = 4.0
         self.assertRaises(ValidationError, person.validate)
+        
+    def test_decimal_validation(self):
+        """Ensure that invalid values cannot be assigned to decimal fields.
+        """
+        class Person(Document):
+            height = DecimalField(min_value=Decimal('0.1'), 
+                                  max_value=Decimal('3.5'))
+
+        Person.drop_collection()
+
+        person = Person()
+        person.height = Decimal('1.89')
+        person.save()
+        person.reload()
+        self.assertEqual(person.height, Decimal('1.89'))
+
+        person.height = '2.0'
+        person.save()
+        person.height = 0.01
+        self.assertRaises(ValidationError, person.validate)
+        person.height = Decimal('0.01')
+        self.assertRaises(ValidationError, person.validate)
+        person.height = Decimal('4.0')
+        self.assertRaises(ValidationError, person.validate)
+
+        Person.drop_collection()
 
     def test_boolean_validation(self):
         """Ensure that invalid values cannot be assigned to boolean fields.
@@ -175,6 +217,37 @@ class FieldTest(unittest.TestCase):
         self.assertRaises(ValidationError, post.validate)
         post.comments = 'yay'
         self.assertRaises(ValidationError, post.validate)
+
+    def test_sorted_list_sorting(self):
+        """Ensure that a sorted list field properly sorts values.
+        """
+        class Comment(EmbeddedDocument):
+            order = IntField()
+            content = StringField()
+
+        class BlogPost(Document):
+            content = StringField()
+            comments = SortedListField(EmbeddedDocumentField(Comment), ordering='order')
+            tags = SortedListField(StringField())
+
+        post = BlogPost(content='Went for a walk today...')
+        post.save()
+
+        post.tags = ['leisure', 'fun']
+        post.save()
+        post.reload()
+        self.assertEqual(post.tags, ['fun', 'leisure'])
+        
+        comment1 = Comment(content='Good for you', order=1)
+        comment2 = Comment(content='Yay.', order=0)
+        comments = [comment1, comment2]
+        post.comments = comments
+        post.save()
+        post.reload()
+        self.assertEqual(post.comments[0].content, comment2.content)
+        self.assertEqual(post.comments[1].content, comment1.content)
+
+        BlogPost.drop_collection()
 
     def test_dict_validation(self):
         """Ensure that dict types work as expected.
@@ -285,6 +358,68 @@ class FieldTest(unittest.TestCase):
 
         User.drop_collection()
         BlogPost.drop_collection()
+    
+    def test_list_item_dereference(self):
+        """Ensure that DBRef items in ListFields are dereferenced.
+        """
+        class User(Document):
+            name = StringField()
+
+        class Group(Document):
+            members = ListField(ReferenceField(User))
+
+        User.drop_collection()
+        Group.drop_collection()
+
+        user1 = User(name='user1')
+        user1.save()
+        user2 = User(name='user2')
+        user2.save()
+
+        group = Group(members=[user1, user2])
+        group.save()
+
+        group_obj = Group.objects.first()
+
+        self.assertEqual(group_obj.members[0].name, user1.name)
+        self.assertEqual(group_obj.members[1].name, user2.name)
+
+        User.drop_collection()
+        Group.drop_collection()
+
+    def test_recursive_reference(self):
+        """Ensure that ReferenceFields can reference their own documents.
+        """
+        class Employee(Document):
+            name = StringField()
+            boss = ReferenceField('self')
+
+        bill = Employee(name='Bill Lumbergh')
+        bill.save()
+        peter = Employee(name='Peter Gibbons', boss=bill)
+        peter.save()
+
+        peter = Employee.objects.with_id(peter.id)
+        self.assertEqual(peter.boss, bill)
+
+    def test_undefined_reference(self):
+        """Ensure that ReferenceFields may reference undefined Documents.
+        """
+        class Product(Document):
+            name = StringField()
+            company = ReferenceField('Company')
+
+        class Company(Document):
+            name = StringField()
+
+        ten_gen = Company(name='10gen')
+        ten_gen.save()
+        mongodb = Product(name='MongoDB', company=ten_gen)
+        mongodb.save()
+
+        obj = Product.objects(company=ten_gen).first()
+        self.assertEqual(obj, mongodb)
+        self.assertEqual(obj.company, ten_gen)
 
     def test_reference_query_conversion(self):
         """Ensure that ReferenceFields can be queried using objects and values
@@ -311,14 +446,167 @@ class FieldTest(unittest.TestCase):
         post2 = BlogPost(title='post 2', author=m2)
         post2.save()
 
-        post = BlogPost.objects(author=m1.id).first()
+        post = BlogPost.objects(author=m1).first()
         self.assertEqual(post.id, post1.id)
 
-        post = BlogPost.objects(author=m2.id).first()
+        post = BlogPost.objects(author=m2).first()
         self.assertEqual(post.id, post2.id)
 
         Member.drop_collection()
         BlogPost.drop_collection()
+        
+    def test_generic_reference(self):
+        """Ensure that a GenericReferenceField properly dereferences items.
+        """
+        class Link(Document):
+            title = StringField()
+            meta = {'allow_inheritance': False}
+            
+        class Post(Document):
+            title = StringField()
+            
+        class Bookmark(Document):
+            bookmark_object = GenericReferenceField()
+            
+        Link.drop_collection()
+        Post.drop_collection()
+        Bookmark.drop_collection()
+    
+        link_1 = Link(title="Pitchfork")
+        link_1.save()
+    
+        post_1 = Post(title="Behind the Scenes of the Pavement Reunion")
+        post_1.save()
+        
+        bm = Bookmark(bookmark_object=post_1)
+        bm.save()
+        
+        bm = Bookmark.objects(bookmark_object=post_1).first()
+        
+        self.assertEqual(bm.bookmark_object, post_1)
+        self.assertTrue(isinstance(bm.bookmark_object, Post))
+        
+        bm.bookmark_object = link_1
+        bm.save()
+        
+        bm = Bookmark.objects(bookmark_object=link_1).first()
+        
+        self.assertEqual(bm.bookmark_object, link_1)
+        self.assertTrue(isinstance(bm.bookmark_object, Link))
+    
+        Link.drop_collection()
+        Post.drop_collection()
+        Bookmark.drop_collection()
+
+    def test_generic_reference_list(self):
+        """Ensure that a ListField properly dereferences generic references.
+        """
+        class Link(Document):
+            title = StringField()
+    
+        class Post(Document):
+            title = StringField()
+    
+        class User(Document):
+            bookmarks = ListField(GenericReferenceField())
+    
+        Link.drop_collection()
+        Post.drop_collection()
+        User.drop_collection()
+    
+        link_1 = Link(title="Pitchfork")
+        link_1.save()
+    
+        post_1 = Post(title="Behind the Scenes of the Pavement Reunion")
+        post_1.save()
+    
+        user = User(bookmarks=[post_1, link_1])
+        user.save()
+        
+        user = User.objects(bookmarks__all=[post_1, link_1]).first()
+        
+        self.assertEqual(user.bookmarks[0], post_1)
+        self.assertEqual(user.bookmarks[1], link_1)
+        
+        Link.drop_collection()
+        Post.drop_collection()
+        User.drop_collection()
+
+    def test_binary_fields(self):
+        """Ensure that binary fields can be stored and retrieved.
+        """
+        class Attachment(Document):
+            content_type = StringField()
+            blob = BinaryField()
+
+        BLOB = '\xe6\x00\xc4\xff\x07'
+        MIME_TYPE = 'application/octet-stream'
+
+        Attachment.drop_collection()
+
+        attachment = Attachment(content_type=MIME_TYPE, blob=BLOB)
+        attachment.save()
+
+        attachment_1 = Attachment.objects().first()
+        self.assertEqual(MIME_TYPE, attachment_1.content_type)
+        self.assertEqual(BLOB, attachment_1.blob)
+
+        Attachment.drop_collection()
+
+    def test_binary_validation(self):
+        """Ensure that invalid values cannot be assigned to binary fields.
+        """
+        class Attachment(Document):
+            blob = BinaryField()
+
+        class AttachmentRequired(Document):
+            blob = BinaryField(required=True)
+
+        class AttachmentSizeLimit(Document):
+            blob = BinaryField(max_bytes=4)
+
+        Attachment.drop_collection()
+        AttachmentRequired.drop_collection()
+        AttachmentSizeLimit.drop_collection()
+
+        attachment = Attachment()
+        attachment.validate()
+        attachment.blob = 2
+        self.assertRaises(ValidationError, attachment.validate)
+
+        attachment_required = AttachmentRequired()
+        self.assertRaises(ValidationError, attachment_required.validate)
+        attachment_required.blob = '\xe6\x00\xc4\xff\x07'
+        attachment_required.validate()
+
+        attachment_size_limit = AttachmentSizeLimit(blob='\xe6\x00\xc4\xff\x07')
+        self.assertRaises(ValidationError, attachment_size_limit.validate)
+        attachment_size_limit.blob = '\xe6\x00\xc4\xff'
+        attachment_size_limit.validate()
+
+        Attachment.drop_collection()
+        AttachmentRequired.drop_collection()
+        AttachmentSizeLimit.drop_collection()
+
+    def test_choices_validation(self):
+        """Ensure that value is in a container of allowed values.
+        """
+        class Shirt(Document):
+            size = StringField(max_length=3, choices=('S','M','L','XL','XXL'))
+
+        Shirt.drop_collection()
+
+        shirt = Shirt()
+        shirt.validate()
+
+        shirt.size = "S"
+        shirt.validate()
+
+        shirt.size = "XS"
+        self.assertRaises(ValidationError, shirt.validate)
+
+        Shirt.drop_collection()
+
 
 
 if __name__ == '__main__':

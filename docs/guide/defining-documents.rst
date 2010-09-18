@@ -22,7 +22,7 @@ objects** as class attributes to the document class::
     
     class Page(Document):
         title = StringField(max_length=200, required=True)
-        date_modified = DateTimeField(default=datetime.now)
+        date_modified = DateTimeField(default=datetime.datetime.now)
 
 Fields
 ======
@@ -35,14 +35,51 @@ to retrieve the value (such as in the above example). The field types available
 are as follows:
 
 * :class:`~mongoengine.StringField`
+* :class:`~mongoengine.URLField`
 * :class:`~mongoengine.IntField`
 * :class:`~mongoengine.FloatField`
+* :class:`~mongoengine.DecimalField`
 * :class:`~mongoengine.DateTimeField`
 * :class:`~mongoengine.ListField`
 * :class:`~mongoengine.DictField`
 * :class:`~mongoengine.ObjectIdField`
 * :class:`~mongoengine.EmbeddedDocumentField`
 * :class:`~mongoengine.ReferenceField`
+* :class:`~mongoengine.GenericReferenceField`
+
+Field arguments
+---------------
+Each field type can be customized by keyword arguments.  The following keyword 
+arguments can be set on all fields:
+
+:attr:`db_field` (Default: None)
+    The MongoDB field name.
+
+:attr:`name` (Default: None)
+    The mongoengine field name.
+
+:attr:`required` (Default: False)
+    If set to True and the field is not set on the document instance, a
+    :class:`~mongoengine.base.ValidationError` will be raised when the document is
+    validated.
+
+:attr:`default` (Default: None)
+    A value to use when no value is set for this field.
+
+:attr:`unique` (Default: False)
+    When True, no documents in the collection will have the same value for this
+    field.
+
+:attr:`unique_with` (Default: None)
+    A field name (or list of field names) that when taken together with this
+    field, will not have two documents in the collection with the same value.
+
+:attr:`primary_key` (Default: False)
+    When True, use this field as a primary key for the collection.
+
+:attr:`choices` (Default: None)
+    An iterable of choices to which the value of this field should be limited.
+    
 
 List fields
 -----------
@@ -117,6 +154,51 @@ field::
 The :class:`User` object is automatically turned into a reference behind the
 scenes, and dereferenced when the :class:`Page` object is retrieved.
 
+To add a :class:`~mongoengine.ReferenceField` that references the document
+being defined, use the string ``'self'`` in place of the document class as the
+argument to :class:`~mongoengine.ReferenceField`'s constructor. To reference a
+document that has not yet been defined, use the name of the undefined document
+as the constructor's argument::
+
+    class Employee(Document):
+        name = StringField()
+        boss = ReferenceField('self')
+        profile_page = ReferenceField('ProfilePage')
+
+    class ProfilePage(Document):
+        content = StringField()
+
+Generic reference fields
+''''''''''''''''''''''''
+A second kind of reference field also exists,
+:class:`~mongoengine.GenericReferenceField`. This allows you to reference any
+kind of :class:`~mongoengine.Document`, and hence doesn't take a 
+:class:`~mongoengine.Document` subclass as a constructor argument::
+
+    class Link(Document):
+        url = StringField()
+        
+    class Post(Document):
+        title = StringField()
+        
+    class Bookmark(Document):
+        bookmark_object = GenericReferenceField()
+
+    link = Link(url='http://hmarr.com/mongoengine/')
+    link.save()
+
+    post = Post(title='Using MongoEngine')
+    post.save()
+
+    Bookmark(bookmark_object=link).save()
+    Bookmark(bookmark_object=post).save()
+
+.. note::
+   Using :class:`~mongoengine.GenericReferenceField`\ s is slightly less
+   efficient than the standard :class:`~mongoengine.ReferenceField`\ s, so if
+   you will only be referencing one document type, prefer the standard 
+   :class:`~mongoengine.ReferenceField`.
+
 Uniqueness constraints
 ----------------------
 MongoEngine allows you to specify that a field should be unique across a
@@ -130,7 +212,7 @@ either a single field name, or a list or tuple of field names::
     class User(Document):
         username = StringField(unique=True)
         first_name = StringField()
-        last_name = StringField(unique_with='last_name')
+        last_name = StringField(unique_with='first_name')
 
 Document collections
 ====================
